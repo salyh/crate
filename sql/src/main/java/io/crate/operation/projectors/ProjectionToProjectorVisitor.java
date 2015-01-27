@@ -319,6 +319,7 @@ public class ProjectionToProjectorVisitor extends ProjectionVisitor<ProjectionTo
                 shardId,
                 transportActionProvider.transportShardUpdateAction(),
                 ctx.collectExpressions().toArray(new CollectExpression[ctx.collectExpressions().size()])[0],
+                projection.assignmentsColumns(),
                 projection.assignments(),
                 projection.requiredVersion());
     }

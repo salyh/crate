@@ -603,17 +603,8 @@ public class TransportExecutorTest extends BaseTransportExecutorTest {
         setup.setUpCharacters();
 
         // update characters set name='Vogon lyric fan' where id=1
-        UpdateByIdNode updateNode = new UpdateByIdNode(
-                "characters",
-                "1",
-                "1",
-                new HashMap<String, Symbol>(){{
-                    put(nameRef.info().ident().columnIdent().fqn(), Literal.newLiteral("Vogon lyric fan"));
-                }},
-                Optional.<Long>absent(),
-                null,
-                null
-        );
+        UpdateByIdNode updateNode = new UpdateByIdNode("characters", new Reference[]{nameRef}, null);
+        updateNode.add("1", "1", new Symbol[]{ Literal.newLiteral("Vogon lyric fan")}, null);
         Plan plan = new IterablePlan(updateNode);
 
         Job job = executor.newJob(plan);
@@ -647,15 +638,10 @@ public class TransportExecutorTest extends BaseTransportExecutorTest {
         Object[] missingAssignments = new Object[]{5, new BytesRef("Zaphod Beeblebrox"), false};
         UpdateByIdNode updateNode = new UpdateByIdNode(
                 "characters",
-                "5",
-                "5",
-                new HashMap<String, Symbol>(){{
-                    put(nameRef.info().ident().columnIdent().fqn(), Literal.newLiteral("Zaphod Beeblebrox"));
-                }},
-                Optional.<Long>fromNullable(null),
-                missingAssignments,
-                new Reference[]{idRef, nameRef, femaleRef}
-        );
+                new Reference[]{nameRef},
+                new Reference[]{idRef, nameRef, femaleRef});
+
+        updateNode.add("5", "5", new Symbol[]{Literal.newLiteral("Zaphod Beeblebrox")}, null, missingAssignments);
         Plan plan = new IterablePlan(updateNode);
         Job job = executor.newJob(plan);
         assertThat(job.tasks().get(0), instanceOf(UpdateByIdTask.class));
@@ -686,15 +672,9 @@ public class TransportExecutorTest extends BaseTransportExecutorTest {
         Object[] missingAssignments = new Object[]{1, new BytesRef("Zaphod Beeblebrox"), true};
         UpdateByIdNode updateNode = new UpdateByIdNode(
                 "characters",
-                "1",
-                "1",
-                new HashMap<String, Symbol>(){{
-                    put(femaleRef.info().ident().columnIdent().fqn(), Literal.newLiteral(true));
-                }},
-                Optional.<Long>fromNullable(null),
-                missingAssignments,
-                new Reference[]{idRef, nameRef, femaleRef}
-        );
+                new Reference[]{femaleRef},
+                new Reference[]{idRef, nameRef, femaleRef});
+        updateNode.add("1", "1", new Symbol[]{Literal.newLiteral(true)}, null, missingAssignments);
         Plan plan = new IterablePlan(updateNode);
         Job job = executor.newJob(plan);
         assertThat(job.tasks().get(0), instanceOf(UpdateByIdTask.class));

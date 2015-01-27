@@ -56,6 +56,7 @@ import io.crate.types.DataType;
 import io.crate.types.DataTypes;
 import io.crate.types.LongType;
 import org.elasticsearch.cluster.routing.operation.plain.Preference;
+import org.elasticsearch.common.collect.Tuple;
 
 import java.util.*;
 
@@ -141,9 +142,12 @@ public class UpdateConsumer implements Consumer {
                                 new ReferenceIdent(tableInfo.ident(), "_uid"),
                                 RowGranularity.DOC, DataTypes.STRING));
 
+                Tuple<Reference[], Symbol[]> assignments = convertAssignments(nestedAnalysis.assignments());
+
                 UpdateProjection updateProjection = new UpdateProjection(
                         new InputColumn(0, DataTypes.STRING),
-                        convertAssignments(nestedAnalysis.assignments()),
+                        assignments.v1(),
+                        assignments.v2(),
                         whereClauseContext.whereClause().version().orNull());
 
                 CollectNode collectNode = PlanNodeBuilder.collect(
@@ -170,25 +174,33 @@ public class UpdateConsumer implements Consumer {
             assert indices.length == 1;
             assert whereClauseContext.ids().size() == whereClauseContext.routingValues().size();
             List<DQLPlanNode> nodes = new ArrayList<>(whereClauseContext.ids().size());
+
+            Tuple<Reference[], Symbol[]> assignments = convertAssignments(nestedAnalysis.assignments());
+
+            UpdateByIdNode updateByIdNode = new UpdateByIdNode(indices[0], assignments.v1(), null);
             for (int i = 0; i < whereClauseContext.ids().size(); i++) {
-                nodes.add(new UpdateByIdNode(
-                                indices[0],
-                                whereClauseContext.ids().get(i),
-                                whereClauseContext.routingValues().get(i),
-                                convertAssignments(nestedAnalysis.assignments()),
-                                whereClause.version(),
-                                null,
-                                null));
+                updateByIdNode.add(
+                        whereClauseContext.ids().get(i),
+                        whereClauseContext.routingValues().get(i),
+                        assignments.v2(),
+                        whereClause.version().orNull());
             }
+            nodes.add(updateByIdNode);
             return nodes;
         }
 
-        private Map<String, Symbol> convertAssignments(Map<Reference, Symbol> assignments) {
-            Map<String, Symbol> convertedAssignments = new HashMap<>(assignments.size());
-            for(Map.Entry<Reference, Symbol> entry : assignments.entrySet()) {
-                convertedAssignments.put(entry.getKey().info().ident().columnIdent().fqn(), entry.getValue());
+        private Tuple<Reference[], Symbol[]> convertAssignments(Map<Reference, Symbol> assignments) {
+            Reference[] assignmentColumns = new Reference[assignments.size()];
+            Symbol[] assignmentSymbols = new Symbol[assignments.size()];
+            Iterator<Reference> it = assignments.keySet().iterator();
+            int i = 0;
+            while(it.hasNext()) {
+                Reference key = it.next();
+                assignmentColumns[i] = key;
+                assignmentSymbols[i] = assignments.get(key);
+                i++;
             }
-            return convertedAssignments;
+            return new Tuple<>(assignmentColumns, assignmentSymbols);
         }
 
         @Override

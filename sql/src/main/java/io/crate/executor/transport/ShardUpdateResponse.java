@@ -21,83 +21,213 @@
 
 package io.crate.executor.transport;
 
-import io.crate.Constants;
+import com.carrotsearch.hppc.IntArrayList;
 import org.elasticsearch.action.ActionResponse;
 import org.elasticsearch.common.io.stream.StreamInput;
 import org.elasticsearch.common.io.stream.StreamOutput;
+import org.elasticsearch.common.io.stream.Streamable;
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
 
 public class ShardUpdateResponse extends ActionResponse {
 
+    /**
+     * Represents a failure.
+     */
+    public static class Failure implements Streamable {
+
+        private String id;
+        private String message;
+        private boolean versionConflict;
+
+        Failure() {
+
+        }
+
+        public Failure(String id, String message, boolean versionConflict) {
+            this.id = id;
+            this.message = message;
+            this.versionConflict = versionConflict;
+        }
+
+        public String id() {
+            return id;
+        }
+
+        public String message() {
+            return this.message;
+        }
+
+        public boolean versionConflict() {
+            return versionConflict;
+        }
+
+        public static Failure readFailure(StreamInput in) throws IOException {
+            Failure failure = new Failure();
+            failure.readFrom(in);
+            return failure;
+        }
+
+        @Override
+        public void readFrom(StreamInput in) throws IOException {
+            id = in.readString();
+            message = in.readString();
+            versionConflict = in.readBoolean();
+        }
+
+        @Override
+        public void writeTo(StreamOutput out) throws IOException {
+            out.writeString(id);
+            out.writeString(message);
+            out.writeBoolean(versionConflict);
+        }
+    }
+
+    public static class Response implements Streamable {
+
+        private String id;
+        private long version;
+        private boolean created;
+
+        public Response() {
+        }
+
+        public Response(String id, long version, boolean created) {
+            this.id = id;
+            this.version = version;
+            this.created = created;
+        }
+
+        public String id() {
+            return this.id;
+        }
+
+        /**
+         * Returns the current version of the doc indexed.
+         */
+        public long version() {
+            return this.version;
+        }
+
+        /**
+         * Returns true if document was created due to an UPSERT operation
+         */
+        public boolean created() {
+            return this.created;
+
+        }
+
+        public static Response readResponse(StreamInput in) throws IOException {
+            Response response = new Response();
+            response.readFrom(in);
+            return response;
+        }
+
+        @Override
+        public void readFrom(StreamInput in) throws IOException {
+            id = in.readString();
+            version = in.readLong();
+            created = in.readBoolean();
+        }
+
+        @Override
+        public void writeTo(StreamOutput out) throws IOException {
+            out.writeString(id);
+            out.writeLong(version);
+            out.writeBoolean(created);
+        }
+    }
+
     private String index;
-    private String id;
-    private long version;
-    private boolean created;
+    private IntArrayList locations;
+    private List<Response> responses;
+    private List<Failure> failures;
 
     public ShardUpdateResponse() {
-
+        locations = new IntArrayList();
+        responses = new ArrayList<>();
+        failures = new ArrayList<>();
     }
 
-    public ShardUpdateResponse(String index, String id, long version, boolean created) {
+    public ShardUpdateResponse(String index) {
+        this();
         this.index = index;
-        this.id = id;
-        this.version = version;
-        this.created = created;
     }
 
-    /**
-     * The index the document was indexed into.
-     */
-    public String getIndex() {
+    public String index() {
         return this.index;
     }
 
-    /**
-     * The type of the document indexed.
-     */
-    public String getType() {
-        return Constants.DEFAULT_MAPPING_TYPE;
+    public void add(int location, Response response) {
+        locations.add(location);
+        responses.add(response);
+        failures.add(null);
     }
 
-    /**
-     * The id of the document indexed.
-     */
-    public String getId() {
-        return this.id;
+    public void add(int location, Failure failure) {
+        locations.add(location);
+        responses.add(null);
+        failures.add(failure);
     }
 
-    /**
-     * Returns the current version of the doc indexed.
-     */
-    public long getVersion() {
-        return this.version;
+    public IntArrayList locations() {
+        return locations;
     }
 
-    /**
-     * Returns true if document was created due to an UPSERT operation
-     */
-    public boolean isCreated() {
-        return this.created;
-
+    public List<Response> responses() {
+        return responses;
     }
+
+    public List<Failure> failures() {
+        return failures;
+    }
+
 
     @Override
     public void readFrom(StreamInput in) throws IOException {
         super.readFrom(in);
         index = in.readSharedString();
-        id = in.readString();
-        version = in.readLong();
-        created = in.readBoolean();
+        int size = in.readVInt();
+        locations = new IntArrayList(size);
+        responses = new ArrayList<>(size);
+        failures = new ArrayList<>(size);
+        for (int i = 0; i < size; i++) {
+            locations.add(in.readVInt());
+            if (in.readBoolean()) {
+                responses.add(Response.readResponse(in));
+            } else {
+                responses.add(null);
+            }
+            if (in.readBoolean()) {
+                failures.add(Failure.readFailure(in));
+            } else {
+                failures.add(null);
+            }
+        }
     }
 
     @Override
     public void writeTo(StreamOutput out) throws IOException {
         super.writeTo(out);
         out.writeSharedString(index);
-        out.writeString(id);
-        out.writeLong(version);
-        out.writeBoolean(created);
+        out.writeVInt(locations.size());
+        for (int i = 0; i < locations.size(); i++) {
+            out.writeVInt(locations.get(i));
+            if (responses.get(i) == null) {
+                out.writeBoolean(false);
+            } else {
+                out.writeBoolean(true);
+                responses.get(i).writeTo(out);
+            }
+            if (failures.get(i) == null) {
+                out.writeBoolean(false);
+            } else {
+                out.writeBoolean(true);
+                failures.get(i).writeTo(out);
+            }
+        }
     }
 
 }

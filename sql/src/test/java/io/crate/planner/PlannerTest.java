@@ -756,9 +756,10 @@ public class PlannerTest {
         UpdateProjection updateProjection = (UpdateProjection)collectNode.projections().get(0);
         assertThat(updateProjection.uidSymbol(), instanceOf(InputColumn.class));
 
-        Map.Entry<String, Symbol> entry = updateProjection.assignments().entrySet().iterator().next();
-        assertThat(entry.getKey(), is("name"));
-        assertThat(entry.getValue(), isLiteral("Vogon lyric fan", DataTypes.STRING));
+        Reference reference = updateProjection.assignmentsColumns()[0];
+        assertThat(reference.info().ident().columnIdent().fqn(), is("name"));
+        Symbol symbol = updateProjection.assignments()[0];
+        assertThat(symbol, isLiteral("Vogon lyric fan", DataTypes.STRING));
 
         MergeNode mergeNode = (MergeNode)childNodes.get(1);
         assertThat(mergeNode.projections().size(), is(1));
@@ -776,11 +777,16 @@ public class PlannerTest {
 
         UpdateByIdNode updateNode = (UpdateByIdNode)childNodes.get(0);
         assertThat(updateNode.index(), is("users"));
-        assertThat(updateNode.id(), is("1"));
+        assertThat(updateNode.items().size(), is(1));
 
-        Map.Entry<String, Symbol> entry = updateNode.assignments().entrySet().iterator().next();
-        assertThat(entry.getKey(), is("name"));
-        assertThat(entry.getValue(), isLiteral("Vogon lyric fan", DataTypes.STRING));
+        Reference reference = updateNode.assignmentsColumns()[0];
+        assertThat(reference.info().ident().columnIdent().fqn(), is("name"));
+
+        UpdateByIdNode.Item item = updateNode.items().get(0);
+        assertThat(item.id(), is("1"));
+
+        Symbol symbol = item.assignments()[0];
+        assertThat(symbol, isLiteral("Vogon lyric fan", DataTypes.STRING));
     }
 
     @Test
@@ -789,12 +795,16 @@ public class PlannerTest {
         assertThat(planNode.nodes().size(), is(1));
 
         List<DQLPlanNode> childNodes = planNode.nodes().get(0);
-        assertThat(childNodes.size(), is(3));
+        assertThat(childNodes.size(), is(1));
+
+        assertThat(childNodes.get(0), instanceOf(UpdateByIdNode.class));
+        UpdateByIdNode updateNode = (UpdateByIdNode)childNodes.get(0);
 
         List<String> ids = new ArrayList<>(3);
-        for (DQLPlanNode executionNode : childNodes) {
-            assertThat(executionNode, instanceOf(UpdateByIdNode.class));
-            ids.add(((UpdateByIdNode)executionNode).id());
+        for (UpdateByIdNode.Item item : updateNode.items()) {
+            ids.add(item.id());
+            assertThat(item.assignments().length, is(1));
+            assertThat(item.assignments()[0], isLiteral("Vogon lyric fan", DataTypes.STRING));
         }
 
         assertThat(ids, containsInAnyOrder("1", "2", "3"));

@@ -21,65 +21,103 @@
 
 package io.crate.planner.node.dml;
 
-import com.google.common.base.Optional;
 import io.crate.planner.node.PlanNodeVisitor;
 import io.crate.planner.symbol.Reference;
 import io.crate.planner.symbol.Symbol;
 import org.elasticsearch.common.Nullable;
+import org.elasticsearch.common.lucene.uid.Versions;
 
-import java.util.Map;
+import java.util.ArrayList;
+import java.util.List;
 
 public class UpdateByIdNode extends DMLPlanNode {
 
+    /**
+     * A single update item.
+     */
+    public static class Item {
+
+        private final String id;
+        private final String routing;
+        private final Symbol[] assignments;
+        private long version = Versions.MATCH_ANY;
+        @Nullable
+        private Object[] missingAssignments;
+
+        public Item(String id,
+                    String routing,
+                    Symbol[] assignments,
+                    @Nullable Long version,
+                    @Nullable Object[] missingAssignments) {
+            this.id = id;
+            this.routing = routing;
+            this.assignments = assignments;
+            if (version != null) {
+                this.version = version;
+            }
+            this.missingAssignments = missingAssignments;
+        }
+
+        public String id() {
+            return id;
+        }
+
+        public String routing() {
+            return routing;
+        }
+
+        public long version() {
+            return version;
+        }
+
+        public Symbol[] assignments() {
+            return assignments;
+        }
+
+        @Nullable
+        public Object[] missingAssignments() {
+            return missingAssignments;
+        }
+    }
+
+
     private final String index;
-    private final String id;
-    private final String routing;
-    private final Map<String, Symbol> assignments;
-    private final Optional<Long> version;
+    private final List<Item> items;
+    private final Reference[] assignmentsColumns;
     @Nullable
     private final Reference[] missingAssignmentsColumns;
-    @Nullable
-    private final Object[] missingAssignments;
 
     public UpdateByIdNode(String index,
-                          String id,
-                          String routing,
-                          Map<String, Symbol> assignments,
-                          Optional<Long> version,
-                          @Nullable Object[] missingAssignments,
+                          Reference[] assignmentsColumns,
                           @Nullable Reference[] missingAssignmentsColumns) {
         this.index = index;
-        this.id = id;
-        this.routing = routing;
-        this.assignments = assignments;
-        this.version = version;
-        this.missingAssignments = missingAssignments;
+        this.assignmentsColumns = assignmentsColumns;
         this.missingAssignmentsColumns = missingAssignmentsColumns;
+        this.items = new ArrayList<>();
     }
 
     public String index() {
         return index;
     }
 
-    public String id() {
-        return id;
+    public void add(String id, String routing, Symbol[] assignments, @Nullable Long version) {
+        add(id, routing, assignments, version, null);
     }
 
-    public String routing() {
-        return routing;
+    public void add(String id,
+                    String routing,
+                    Symbol[] assignments,
+                    @Nullable Long version,
+                    @Nullable Object[] missingAssignments) {
+        items.add(new Item(id, routing, assignments, version, missingAssignments));
     }
 
-    public Map<String, Symbol> assignments() {
-        return assignments;
+    public List<Item> items() {
+        return items;
     }
 
-    public Optional<Long> version() {
-        return version;
-    }
-
-    @Nullable
-    public Object[] missingAssignments() {
-        return missingAssignments;
+    public Reference[] assignmentsColumns() {
+        return assignmentsColumns;
     }
 
     @Nullable

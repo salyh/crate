@@ -29,8 +29,8 @@ import io.crate.executor.transport.ShardUpdateResponse;
 import io.crate.executor.transport.TransportShardUpdateAction;
 import io.crate.planner.node.dml.UpdateByIdNode;
 import org.elasticsearch.action.ActionListener;
-import org.elasticsearch.index.engine.DocumentMissingException;
-import org.elasticsearch.index.engine.VersionConflictEngineException;
+import org.elasticsearch.common.logging.ESLogger;
+import org.elasticsearch.common.logging.Loggers;
 
 import java.util.UUID;
 
@@ -40,9 +40,11 @@ public class UpdateByIdTask extends AsyncChainedTask {
     private final ActionListener<ShardUpdateResponse> listener;
     private final ShardUpdateRequest request;
 
+
     private static class UpdateResponseListener implements ActionListener<ShardUpdateResponse> {
 
         private final SettableFuture<TaskResult> future;
+        private final ESLogger logger = Loggers.getLogger(getClass());
 
         private UpdateResponseListener(SettableFuture<TaskResult> future) {
             this.future = future;
@@ -50,18 +52,23 @@ public class UpdateByIdTask extends AsyncChainedTask {
 
         @Override
         public void onResponse(ShardUpdateResponse updateResponse) {
-            future.set(TaskResult.ONE_ROW);
+            int location = updateResponse.locations().get(0);
+            if (updateResponse.responses().get(location) != null) {
+                future.set(TaskResult.ONE_ROW);
+            } else {
+                ShardUpdateResponse.Failure failure = updateResponse.failures().get(location);
+                if (failure.versionConflict()) {
+                    logger.debug("Updating document with id {} failed because of a version conflict", failure.id());
+                } else {
+                    logger.error("Updating document with id {} failed {}", failure.id(), failure.message());
+                }
+                future.set(TaskResult.ZERO);
+            }
         }
 
         @Override
         public void onFailure(Throwable e) {
-            e = Exceptions.unwrap(e);
-            if (e instanceof VersionConflictEngineException
-                    || e instanceof DocumentMissingException) {
-                future.set(TaskResult.ZERO);
-            } else {
-                future.setException(e);
-            }
+            future.setException(Exceptions.unwrap(e));
         }
     }
 
@@ -79,14 +86,13 @@ public class UpdateByIdTask extends AsyncChainedTask {
     }
 
     protected ShardUpdateRequest buildUpdateRequest(UpdateByIdNode node) {
-        ShardUpdateRequest request = new ShardUpdateRequest(node.index(), node.id());
-        request.routing(node.routing());
-        if (node.version().isPresent()) {
-            request.version(node.version().get());
+        // TODO: group items by shard and set routing to requests
+        ShardUpdateRequest request = new ShardUpdateRequest(node.index(),
+                node.assignmentsColumns(), node.missingAssignmentsColumns());
+        //request.routing(node.routing());
+        for (UpdateByIdNode.Item item : node.items()) {
+            request.add(0, item.id(), item.assignments(), item.version(), item.missingAssignments());
         }
-        request.assignments(node.assignments());
-        request.missingAssignments(node.missingAssignments());
-        request.missingAssignmentsColumns(node.missingAssignmentsColumns());
         return request;
     }
 }

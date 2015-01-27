@@ -30,16 +30,18 @@ import io.crate.executor.transport.task.elasticsearch.FieldExtractorFactory;
 import io.crate.executor.transport.task.elasticsearch.SymbolToFieldExtractor;
 import io.crate.metadata.Functions;
 import io.crate.planner.symbol.Reference;
-import io.crate.planner.symbol.Symbol;
 import org.elasticsearch.ElasticsearchException;
 import org.elasticsearch.ExceptionsHelper;
 import org.elasticsearch.action.ActionListener;
-import org.elasticsearch.action.ActionRunnable;
 import org.elasticsearch.action.RoutingMissingException;
+import org.elasticsearch.action.admin.indices.create.CreateIndexRequest;
+import org.elasticsearch.action.admin.indices.create.CreateIndexResponse;
+import org.elasticsearch.action.admin.indices.create.TransportCreateIndexAction;
 import org.elasticsearch.action.index.IndexRequest;
 import org.elasticsearch.action.index.IndexResponse;
 import org.elasticsearch.action.index.TransportIndexAction;
 import org.elasticsearch.action.support.ActionFilters;
+import org.elasticsearch.action.support.AutoCreateIndex;
 import org.elasticsearch.action.support.TransportActions;
 import org.elasticsearch.action.support.single.instance.TransportInstanceSingleOperationAction;
 import org.elasticsearch.client.Requests;
@@ -51,7 +53,6 @@ import org.elasticsearch.cluster.routing.ShardRouting;
 import org.elasticsearch.common.collect.Tuple;
 import org.elasticsearch.common.inject.Inject;
 import org.elasticsearch.common.settings.Settings;
-import org.elasticsearch.common.util.concurrent.EsRejectedExecutionException;
 import org.elasticsearch.common.xcontent.XContentHelper;
 import org.elasticsearch.common.xcontent.XContentType;
 import org.elasticsearch.common.xcontent.support.XContentMapValues;
@@ -66,6 +67,7 @@ import org.elasticsearch.index.mapper.internal.TTLFieldMapper;
 import org.elasticsearch.index.service.IndexService;
 import org.elasticsearch.index.shard.ShardId;
 import org.elasticsearch.index.shard.service.IndexShard;
+import org.elasticsearch.indices.IndexAlreadyExistsException;
 import org.elasticsearch.indices.IndicesService;
 import org.elasticsearch.search.fetch.source.FetchSourceContext;
 import org.elasticsearch.threadpool.ThreadPool;
@@ -81,6 +83,8 @@ public class TransportShardUpdateAction extends TransportInstanceSingleOperation
     private final static SymbolToFieldExtractor SYMBOL_TO_FIELD_EXTRACTOR = new SymbolToFieldExtractor(new GetResultFieldExtractorFactory());
 
     private final TransportIndexAction indexAction;
+    private final TransportCreateIndexAction createIndexAction;
+    private final AutoCreateIndex autoCreateIndex;
     private final IndicesService indicesService;
     private final Functions functions;
 
@@ -92,12 +96,15 @@ public class TransportShardUpdateAction extends TransportInstanceSingleOperation
                                       TransportService transportService,
                                       ActionFilters actionFilters,
                                       TransportIndexAction indexAction,
+                                      TransportCreateIndexAction createIndexAction,
                                       IndicesService indicesService,
                                       Functions functions) {
         super(settings, ACTION_NAME, threadPool, clusterService, transportService, actionFilters);
         this.indexAction = indexAction;
+        this.createIndexAction = createIndexAction;
         this.indicesService = indicesService;
         this.functions = functions;
+        this.autoCreateIndex = new AutoCreateIndex(settings);
     }
 
     @Override
@@ -125,7 +132,8 @@ public class TransportShardUpdateAction extends TransportInstanceSingleOperation
         request.request().routing((state.metaData().resolveIndexRouting(request.request().routing(), request.request().index())));
         // Fail fast on the node that received the request, rather than failing when translating on the index or delete request.
         if (request.request().routing() == null && state.getMetaData().routingRequired(request.concreteIndex(), request.request().type())) {
-            throw new RoutingMissingException(request.concreteIndex(), request.request().type(), request.request().id());
+            // as all items are already grouped by shard, if the first fail, all will fail, so lets just take the first item's id here
+            throw new RoutingMissingException(request.concreteIndex(), request.request().type(), request.request().items().get(0).id());
         }
         return true;
     }
@@ -135,8 +143,9 @@ public class TransportShardUpdateAction extends TransportInstanceSingleOperation
         if (request.request().shardId() != -1) {
             return clusterState.routingTable().index(request.concreteIndex()).shard(request.request().shardId()).primaryShardIt();
         }
+        // we assume that all items are already grouped by shard so lets just take the first item's id into account
         ShardIterator shardIterator = clusterService.operationRouting()
-                .indexShards(clusterState, request.concreteIndex(), request.request().type(), request.request().id(), request.request().routing());
+                .indexShards(clusterState, request.concreteIndex(), request.request().type(), request.request().items().get(0).id(), request.request().routing());
         ShardRouting shard;
         while ((shard = shardIterator.nextOrNull()) != null) {
             if (shard.primary()) {
@@ -147,44 +156,89 @@ public class TransportShardUpdateAction extends TransportInstanceSingleOperation
     }
 
     @Override
-    protected void shardOperation(InternalRequest request, ActionListener<ShardUpdateResponse> listener) throws ElasticsearchException {
-        shardOperation(request, listener, 0);
+    protected void doExecute(final ShardUpdateRequest request, final ActionListener<ShardUpdateResponse> listener) {
+        // if we don't have a master, we don't have metadata, that's fine, let it find a master using create index API
+        if (autoCreateIndex.shouldAutoCreate(request.index(), clusterService.state())) {
+            request.beforeLocalFork(); // we fork on another thread...
+            createIndexAction.execute(new CreateIndexRequest(request).index(request.index()).cause("auto(update api)").masterNodeTimeout(request.timeout()), new ActionListener<CreateIndexResponse>() {
+                @Override
+                public void onResponse(CreateIndexResponse result) {
+                    innerExecute(request, listener);
+                }
+
+                @Override
+                public void onFailure(Throwable e) {
+                    if (ExceptionsHelper.unwrapCause(e) instanceof IndexAlreadyExistsException) {
+                        // we have the index, do it
+                        try {
+                            innerExecute(request, listener);
+                        } catch (Throwable e1) {
+                            listener.onFailure(e1);
+                        }
+                    } else {
+                        listener.onFailure(e);
+                    }
+                }
+            });
+        } else {
+            innerExecute(request, listener);
+        }
     }
 
-    protected void shardOperation(final InternalRequest request, final ActionListener<ShardUpdateResponse> listener, final int retryCount) throws ElasticsearchException {
+    private void innerExecute(final ShardUpdateRequest request, final ActionListener<ShardUpdateResponse> listener) {
+        super.doExecute(request, listener);
+    }
+
+
+    @Override
+    protected void shardOperation(final InternalRequest request, final ActionListener<ShardUpdateResponse> listener) throws ElasticsearchException {
         IndexService indexService = indicesService.indexServiceSafe(request.concreteIndex());
         IndexShard indexShard = indexService.shardSafe(request.request().shardId());
 
-        IndexRequest indexRequest = new IndexRequest(prepare(request.request(), indexShard), request.request());
-        indexAction.execute(indexRequest, new ActionListener<IndexResponse>() {
-            @Override
-            public void onResponse(IndexResponse response) {
-                ShardUpdateResponse update = new ShardUpdateResponse(response.getIndex(), response.getId(), response.getVersion(), response.isCreated());
-                listener.onResponse(update);
-            }
-
-            @Override
-            public void onFailure(Throwable e) {
-                e = ExceptionsHelper.unwrapCause(e);
-                if (e instanceof VersionConflictEngineException) {
-                    if (retryCount < request.request().retryOnConflict()) {
-                        try {
-                            threadPool.executor(executor()).execute(new ActionRunnable<ShardUpdateResponse>(listener) {
-                                @Override
-                                protected void doRun() {
-                                    shardOperation(request, listener, retryCount + 1);
-                                }
-                            });
-                        } catch (EsRejectedExecutionException ex) {
-                            logger.debug("Can not run threaded action, execution rejected for listener [{}] running on current thread", listener);
-                            listener.onFailure(e);
-                        }
-                        return;
-                    }
+        ShardUpdateResponse shardUpdateResponse = new ShardUpdateResponse(request.request().index());
+        for (int i = 0; i < request.request().locations().size(); i++) {
+            ShardUpdateRequest.Item item = request.request().items().get(i);
+            try {
+                IndexResponse indexResponse = indexItem(request.request(), item, indexShard, 0);
+                shardUpdateResponse.add(i,
+                        new ShardUpdateResponse.Response(
+                                item.id(),
+                                indexResponse.getVersion(),
+                                indexResponse.isCreated()));
+            } catch (Throwable t) {
+                if (TransportActions.isShardNotAvailableException(t)) {
+                    listener.onFailure(t);
+                    return;
+                } else {
+                    logger.debug("{} failed to execute update for [{}]/[{}]",
+                            t, request.request().shardId(), request.request().type(), item.id());
+                    shardUpdateResponse.add(i,
+                            new ShardUpdateResponse.Failure(
+                                    item.id(),
+                                    ExceptionsHelper.detailedMessage(t),
+                                    (t instanceof VersionConflictEngineException)));
                 }
-                listener.onFailure(e);
             }
-        });
+        }
+        listener.onResponse(shardUpdateResponse);
+    }
+
+    public IndexResponse indexItem(ShardUpdateRequest request,
+                          ShardUpdateRequest.Item item,
+                          IndexShard indexShard,
+                          int retryCount) throws ElasticsearchException {
+        IndexRequest indexRequest = new IndexRequest(prepare(request, item, indexShard), request);
+
+        try {
+            return indexAction.execute(indexRequest).actionGet();
+        } catch (Throwable t) {
+            if (t instanceof VersionConflictEngineException
+                    && retryCount < item.retryOnConflict()) {
+                return indexItem(request, item, indexShard, retryCount + 1);
+            } else {
+                throw t;
+            }
+        }
     }
 
     /**
@@ -193,21 +247,21 @@ public class TransportShardUpdateAction extends TransportInstanceSingleOperation
      * TODO: detect a NOOP and return an update response if true
      */
     @SuppressWarnings("unchecked")
-    public IndexRequest prepare(ShardUpdateRequest request, IndexShard indexShard) {
-        final GetResult getResult = indexShard.getService().get(request.type(), request.id(),
+    public IndexRequest prepare(ShardUpdateRequest request, ShardUpdateRequest.Item item, IndexShard indexShard) {
+        final GetResult getResult = indexShard.getService().get(request.type(), item.id(),
                 new String[]{RoutingFieldMapper.NAME, ParentFieldMapper.NAME, TTLFieldMapper.NAME},
-                true, request.version(), VersionType.INTERNAL, FetchSourceContext.FETCH_SOURCE, false);
+                true, item.version(), VersionType.INTERNAL, FetchSourceContext.FETCH_SOURCE, false);
 
         if (!getResult.isExists()) {
-            if(request.missingAssignments() != null){
-                return prepareMissingAssignmentsIndexRequest(request);
+            if(item.missingAssignments() != null){
+                return prepareMissingAssignmentsIndexRequest(request, item);
             }
-            throw new DocumentMissingException(new ShardId(indexShard.indexService().index().name(), request.shardId()), request.type(), request.id());
+            throw new DocumentMissingException(new ShardId(indexShard.indexService().index().name(), request.shardId()), request.type(), item.id());
         }
 
         if (getResult.internalSourceRef() == null) {
             // no source, we can't do nothing, through a failure...
-            throw new DocumentSourceMissingException(new ShardId(indexShard.indexService().index().name(), request.shardId()), request.type(), request.id());
+            throw new DocumentSourceMissingException(new ShardId(indexShard.indexService().index().name(), request.shardId()), request.type(), item.id());
         }
 
         Tuple<XContentType, Map<String, Object>> sourceAndContent = XContentHelper.convertToMap(getResult.internalSourceRef(), true);
@@ -218,10 +272,10 @@ public class TransportShardUpdateAction extends TransportInstanceSingleOperation
 
         updatedSourceAsMap = sourceAndContent.v2();
 
-        final SymbolToFieldExtractor.Context ctx = new SymbolToFieldExtractor.Context(functions, request.assignments().size());
-        Map<String, FieldExtractor> extractors = new HashMap<>(request.assignments().size());
-        for (Map.Entry<String, Symbol> entry : request.assignments().entrySet()) {
-            extractors.put(entry.getKey(), SYMBOL_TO_FIELD_EXTRACTOR.convert(entry.getValue(), ctx));
+        final SymbolToFieldExtractor.Context ctx = new SymbolToFieldExtractor.Context(functions, item.assignments().length);
+        Map<String, FieldExtractor> extractors = new HashMap<>(item.assignments().length);
+        for (int i = 0; i < request.assignmentsColumns().length; i++) {
+            extractors.put(request.assignmentsColumns()[i].ident().columnIdent().fqn(), SYMBOL_TO_FIELD_EXTRACTOR.convert(item.assignments()[i], ctx));
         }
 
         Map<String, Object> pathsToUpdate = new HashMap<>(extractors.size());
@@ -235,20 +289,20 @@ public class TransportShardUpdateAction extends TransportInstanceSingleOperation
 
         updateSourceByPaths(updatedSourceAsMap, pathsToUpdate);
 
-        final IndexRequest indexRequest = Requests.indexRequest(request.index()).type(request.type()).id(request.id()).routing(routing).parent(parent)
+        final IndexRequest indexRequest = Requests.indexRequest(request.index()).type(request.type()).id(item.id()).routing(routing).parent(parent)
                 .source(updatedSourceAsMap, updateSourceContentType)
                 .version(getResult.getVersion());
         indexRequest.operationThreaded(false);
         return indexRequest;
     }
 
-    private IndexRequest prepareMissingAssignmentsIndexRequest(ShardUpdateRequest request) {
-        Map<String, Object> changes = new HashMap<>(request.missingAssignments().length);
-        for (int i = 0; i < request.missingAssignments().length; i++) {
+    private IndexRequest prepareMissingAssignmentsIndexRequest(ShardUpdateRequest request, ShardUpdateRequest.Item item) {
+        Map<String, Object> changes = new HashMap<>(item.missingAssignments().length);
+        for (int i = 0; i < item.missingAssignments().length; i++) {
             Reference ref = request.missingAssignmentsColumns()[i];
-            changes.put(ref.ident().columnIdent().fqn(), request.missingAssignments()[i]);
+            changes.put(ref.ident().columnIdent().fqn(), item.missingAssignments()[i]);
         }
-        IndexRequest indexRequest = Requests.indexRequest(request.index()).type(request.type()).id(request.id()).routing(request.routing())
+        IndexRequest indexRequest = Requests.indexRequest(request.index()).type(request.type()).id(item.id()).routing(request.routing())
                 .source(changes).create(true).operationThreaded(false);
         return indexRequest;
     }
